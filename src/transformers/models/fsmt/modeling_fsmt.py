@@ -1224,6 +1224,8 @@ class FSMTForConditionalGeneration(PretrainedFSMTModel):
         if labels is not None:
             use_cache = False
 
+        # print("Forwarding in FSMT model")
+
         outputs = self.model(
             input_ids,
             inputs_embeds=inputs_embeds,

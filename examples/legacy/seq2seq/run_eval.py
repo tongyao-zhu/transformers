@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from utils import calculate_bleu, calculate_rouge, chunks, parse_numeric_n_bool_cl_kwargs, use_task_specific_params
-
+from datastore import DataStore
 
 logger = getLogger(__name__)
 
@@ -59,6 +59,8 @@ def generate_summaries_or_translations(
     start_time = time.time()
     # update config with task specific params
     use_task_specific_params(model, task)
+    datastore = DataStore(config = {"saved_dir": "./saved_gen", "vocab_size": tokenizer.vocab_size}, percentage=1)
+    print(datastore)
     if prefix is None:
         prefix = prefix or getattr(model.config, "prefix", "") or ""
     for examples_chunk in tqdm(list(chunks(examples, batch_size))):
@@ -67,6 +69,9 @@ def generate_summaries_or_translations(
         summaries = model.generate(
             input_ids=batch.input_ids,
             attention_mask=batch.attention_mask,
+            output_hidden_states = True,
+            datastore = datastore,
+
             **generate_kwargs,
         )
         dec = tokenizer.batch_decode(summaries, skip_special_tokens=True, clean_up_tokenization_spaces=False)
@@ -126,9 +131,11 @@ def run_generate(verbose=True):
             " lang=en-ru. If no value is passed, the current datetime string will be used."
         ),
     )
+    print("You are here!")
     # Unspecified args like --num_beams=2 --decoder_start_token_id=4 are passed to model.generate
     args, rest = parser.parse_known_args()
     parsed_args = parse_numeric_n_bool_cl_kwargs(rest)
+    parsed_args['output_hidden_states'] = True
     if parsed_args and verbose:
         print(f"parsed the following generate kwargs: {parsed_args}")
     examples = [" " + x.rstrip() if "t5" in args.model_name else x.rstrip() for x in open(args.input_path).readlines()]

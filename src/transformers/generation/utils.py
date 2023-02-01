@@ -997,6 +997,9 @@ class GenerationMixin:
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
         synced_gpus: Optional[bool] = False,
+        datastore = None,
+        k = None,
+        lambda_value = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         r"""
@@ -1136,6 +1139,9 @@ class GenerationMixin:
         ```"""
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         self._validate_model_class()
+        # print("Here")
+        # print("kwargs", kwargs)
+        # print("datastore in generation", datastore)
 
         # priority: `generation_config` argument > `model.generation_config` (the default generation config)
         if generation_config is None:
@@ -1182,10 +1188,13 @@ class GenerationMixin:
             inputs, generation_config.bos_token_id, model_kwargs
         )
         batch_size = inputs_tensor.shape[0]
-
+        # print("generation configs is {}".format(generation_config))
+        # print(model_kwargs)
         # 4. Define other model kwargs
         model_kwargs["output_attentions"] = generation_config.output_attentions
         model_kwargs["output_hidden_states"] = generation_config.output_hidden_states
+        model_kwargs["output_hidden_states"] = True
+
         model_kwargs["use_cache"] = generation_config.use_cache
 
         accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
@@ -1432,6 +1441,8 @@ class GenerationMixin:
                 is_encoder_decoder=self.config.is_encoder_decoder,
                 **model_kwargs,
             )
+           #  model_kwargs['datastore'] = datastore
+
             # 13. run beam search
             return self.beam_search(
                 input_ids,
@@ -1443,6 +1454,9 @@ class GenerationMixin:
                 output_scores=generation_config.output_scores,
                 return_dict_in_generate=generation_config.return_dict_in_generate,
                 synced_gpus=synced_gpus,
+                datastore = datastore,
+                k = k,
+                lambda_value = lambda_value,
                 **model_kwargs,
             )
 
@@ -2474,6 +2488,9 @@ class GenerationMixin:
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: Optional[bool] = False,
+        datastore: Optional = None,
+        lambda_value: Optional = None,
+        k: Optional = None,
         **model_kwargs,
     ) -> Union[BeamSearchOutput, torch.LongTensor]:
         r"""
@@ -2597,6 +2614,7 @@ class GenerationMixin:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
         )
+        output_hidden_states = True
         return_dict_in_generate = (
             return_dict_in_generate
             if return_dict_in_generate is not None
@@ -2648,18 +2666,30 @@ class GenerationMixin:
                     break
 
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            # for key, value in model_inputs.items():
+            #     if not value:
+            #         print(f"key {key} is None")
+            #         continue
+            #     print(key)
+                # print(f"Model inputs {key}", value.shape)
+            # print(model_inputs['decoder_input_ids'].shape)
+            knn_flag = True
+
 
             outputs = self(
                 **model_inputs,
                 return_dict=True,
                 output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
+                output_hidden_states=True,
             )
 
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
                 continue  # don't waste resources running the code we don't need
-
+            # print("Output logits shape", outputs.logits.shape)
+            # print("Output decoder hidden states shape", outputs.decoder_hidden_states[-1].shape)
+            # print("Output decoder hidden states shape", outputs.keys())
+            # print(type(outputs))
             next_token_logits = outputs.logits[:, -1, :]
             # hack: adjust tokens for Marian. For Marian we have to make sure that the `pad_token_id`
             # cannot be generated both before and after the `nn.functional.log_softmax` operation.
@@ -2667,9 +2697,29 @@ class GenerationMixin:
             next_token_scores = nn.functional.log_softmax(
                 next_token_logits, dim=-1
             )  # (batch_size * num_beams, vocab_size)
+            # print("Next token scores", next_token_scores.shape)
+            # print("Next token scores sum", torch.exp(next_token_scores).sum(-1))
+            if lambda_value is not None and lambda_value<1:
+                # print("interpolation here")
+                next_token_scores = nn.functional.softmax(next_token_logits, dim=-1)
+                query = outputs.decoder_hidden_states[-1]
+                # print(query.size(1))
+                assert query.size(1)==1
+                query = query.squeeze()
+                # print("shape of query", query.shape)
+                # knn_scores = nn.functional.softmax(torch.randn(next_token_scores.shape), dim=-1)
+                # print("Started searching")
+                knn_scores = datastore.search_k(query=query.cpu().numpy(), k =k)
+                # knn_scores =  # should have shape (batch_size*num_beams, vocab_size)
+                # print("knn scores sum", knn_scores.sum(-1))
+                # print("Finished searching")
+                next_token_scores = next_token_scores.cpu() * lambda_value + (1-lambda_value) * knn_scores
+                next_token_scores = torch.log(next_token_scores).cuda()
+                # print(" sum", torch.exp(next_token_scores).sum(-1))
 
             next_token_scores_processed = logits_processor(input_ids, next_token_scores)
             next_token_scores = next_token_scores_processed + beam_scores[:, None].expand_as(next_token_scores)
+            # print("Next token scores shape", next_token_scores.shape)
 
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
